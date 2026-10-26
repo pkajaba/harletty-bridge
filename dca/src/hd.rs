@@ -190,8 +190,77 @@ impl HdFrame {
 
 /// Size in bytes of the EXSS substream starting at `data` (which must begin at
 /// the 0x64582025 syncword), for demuxing `[core][exss]` DTS-HD frames.
+///
+/// Reads only the size field of the header (at most the first ten bytes), so a
+/// substream that is not complete yet still gives its size; a caller that
+/// frames a byte stream can then wait for the rest. `None` means the bytes
+/// are too few to hold the field, or do not start with the syncword.
 pub fn exss_substream_size(data: &[u8]) -> Option<usize> {
-    ExssParser::parse(data).ok().map(|p| p.substream_size())
+    if data.get(..4)? != 0x6458_2025u32.to_be_bytes() {
+        return None;
+    }
+    // After the 32 sync bits and 8 user bits: 2 index bits, a wide-header
+    // flag, an 8- or 12-bit header size and a 16- or 20-bit substream size.
+    let tail = data.get(5..)?;
+    let wide = tail.first()? & 0x20 != 0;
+    let skip_bits = 3 + if wide { 12 } else { 8 };
+    let size_bits = if wide { 20 } else { 16 };
+    let mut value = 0usize;
+    for bit in skip_bits..skip_bits + size_bits {
+        let byte = *tail.get(bit / 8)?;
+        value = (value << 1) | ((byte >> (7 - bit % 8)) & 1) as usize;
+    }
+    Some(value + 1)
+}
+
+#[cfg(test)]
+mod exss_size_tests {
+    use super::exss_substream_size;
+
+    /// A substream header up to and including the size field.
+    fn header(wide: bool, header_size: u32, size: u32) -> Vec<u8> {
+        let (hbits, sbits) = if wide { (12, 20) } else { (8, 16) };
+        let mut bits = format!("00{}{:0hbits$b}{:0sbits$b}", wide as u8, header_size, size);
+        while bits.len() % 8 != 0 {
+            bits.push('0');
+        }
+        let mut data = vec![0x64, 0x58, 0x20, 0x25, 0x00];
+        for chunk in bits.as_bytes().chunks(8) {
+            data.push(u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 2).unwrap());
+        }
+        data
+    }
+
+    #[test]
+    fn the_size_is_read_from_a_header_that_is_not_complete() {
+        let h = header(false, 0x0f, 0x0123);
+        assert_eq!(h.len(), 9);
+        assert_eq!(exss_substream_size(&h), Some(0x0124));
+        assert_eq!(exss_substream_size(&h[..8]), None);
+        assert_eq!(exss_substream_size(&[0u8; 12]), None);
+    }
+
+    #[test]
+    fn a_wide_header_has_longer_fields() {
+        let h = header(true, 0x00f, 0x01234);
+        assert_eq!(exss_substream_size(&h), Some(0x01235));
+        assert_eq!(exss_substream_size(&h[..h.len() - 1]), None);
+    }
+
+    #[test]
+    fn every_cut_before_the_end_of_the_field_waits_and_every_cut_after_it_answers() {
+        for (wide, size_end) in [(false, 9), (true, 10)] {
+            let h = header(wide, 0x0f, 0x0123);
+            for cut in 0..=h.len() {
+                let expected = if cut >= size_end { Some(0x0124) } else { None };
+                assert_eq!(
+                    exss_substream_size(&h[..cut]),
+                    expected,
+                    "wide {wide}, cut {cut}"
+                );
+            }
+        }
+    }
 }
 
 /// True when the EXSS at `data` carries an XLL (DTS-HD MA, lossless) asset, i.e.
