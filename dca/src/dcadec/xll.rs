@@ -889,9 +889,18 @@ impl XllDecoder {
         self.filter_frame(core)
     }
 
-    /// Empty `output`, keeping its buffers for the next frame.
+    /// Empty `output`, keeping its buffers for the next frame. The extension
+    /// waveforms are not touched: `parse` fills them and `filter_frame`, which
+    /// calls this, still has to hand them on.
     pub(crate) fn release_output(&mut self) {
         self.pool.give_slots(&mut self.output);
+    }
+
+    /// Empty `x_output` too, for a frame that is not decoded from XLL, so a
+    /// reader of the extension waveforms does not see the previous frame's.
+    pub(crate) fn release_all_output(&mut self) {
+        self.release_output();
+        self.pool.give_all(&mut self.x_output);
     }
 
     fn clear_pbr(&mut self) {
@@ -2526,6 +2535,26 @@ mod alt_extension_tests {
             common_geometry_candidates_between(&d0_outer, 18, 25),
             [(2, 10)]
         );
+    }
+
+    #[test]
+    fn the_extension_waveforms_outlive_release_output_but_not_release_all_output() {
+        use crate::dcadec::xmeta::fixtures::D0_THREE_COMPONENT_PAYLOAD;
+
+        let mut decoder = XllDecoder::new();
+        decoder
+            .try_decode_alternate_x_extension_audio(&D0_THREE_COMPONENT_PAYLOAD)
+            .expect("decode the three-channel D0 payload");
+        assert_eq!(decoder.x_output.len(), 7);
+
+        // The bed is handed back after the filter; the waveforms must stay.
+        decoder.release_output();
+        assert_eq!(decoder.x_output.len(), 7);
+
+        // A frame that does not come from XLL leaves nothing of the last one.
+        decoder.release_all_output();
+        assert!(decoder.x_output.is_empty());
+        assert!(decoder.output.iter().all(Option::is_none));
     }
 
     /// The D0 marker over a three-channel first set: the smallest (silent)

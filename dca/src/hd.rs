@@ -279,6 +279,9 @@ pub struct HdDecoder {
     xll: XllDecoder,
     /// The core as synthesized for the current frame, kept for its buffers.
     core_out: CoreOutput,
+    /// Whether `decode_into` fills the frame's f32 sample buffers. A reader of
+    /// the integer taps only turns it off to skip the conversion.
+    float_output: bool,
 }
 
 impl Default for HdDecoder {
@@ -296,7 +299,18 @@ impl HdDecoder {
             synth: SynthState::default(),
             xll: XllDecoder::new(),
             core_out: CoreOutput::default(),
+            float_output: true,
         }
+    }
+
+    /// Choose whether `decode_into` converts the PCM to f32 into
+    /// `HdFrame::samples` / `HdFrame::x_samples`. On by default. With it off
+    /// those buffers come back empty and the integer taps
+    /// ([`Self::lossless_samples`], [`Self::core_samples`] and their `_x_`
+    /// forms) are the only way to read the PCM; the rest of the frame
+    /// (masks, rate, X payload) is filled as usual.
+    pub fn set_float_output(&mut self, on: bool) {
+        self.float_output = on;
     }
 
     pub fn reset(&mut self) {
@@ -309,13 +323,48 @@ impl HdDecoder {
     /// index, as integers — before the float conversion `decode` hands out.
     /// Active speakers only. This is the tap for anything that reads the low
     /// bits of the PCM (an Auro-Codec carrier keeps its side channel there),
-    /// which a float round trip would not preserve.
+    /// which a float round trip would not preserve. Empty unless the frame
+    /// came through XLL: a lossy frame has no lossless samples.
     pub fn lossless_samples(&self) -> impl Iterator<Item = (usize, &[i32])> {
         self.xll
             .output
             .iter()
             .enumerate()
             .filter_map(|(speaker, channel)| channel.as_deref().map(|v| (speaker, v)))
+    }
+
+    /// The lossless 24-bit samples of the extension waveforms (DTS:X feeds)
+    /// of the last frame, before float conversion, by channel index. Empty
+    /// unless the frame came through XLL.
+    pub fn lossless_x_samples(&self) -> impl Iterator<Item = (usize, &[i32])> {
+        self.xll
+            .x_output
+            .iter()
+            .enumerate()
+            .map(|(channel, v)| (channel, v.as_slice()))
+    }
+
+    /// The integer PCM of the core synthesis (plus XXCH and the lossy
+    /// extension) of the last frame, by DCA speaker index. These are 24-bit
+    /// integers but a lossy decode: a caller that wants lossless data uses
+    /// [`Self::lossless_samples`] and decides what to do when it is empty.
+    /// Valid after a frame decoded without XLL; stale after an XLL frame.
+    pub fn core_samples(&self) -> impl Iterator<Item = (usize, &[i32])> {
+        self.core_out
+            .samples
+            .iter()
+            .enumerate()
+            .filter_map(|(speaker, channel)| channel.as_deref().map(|v| (speaker, v)))
+    }
+
+    /// The integer extension waveforms of the lossy route (the four height
+    /// feeds), by channel index; see [`Self::core_samples`].
+    pub fn core_x_samples(&self) -> impl Iterator<Item = (usize, &[i32])> {
+        self.core_out
+            .extension
+            .iter()
+            .enumerate()
+            .map(|(channel, v)| (channel, v.as_slice()))
     }
 
     /// Decode one DTS-HD frame from its core access unit + EXSS substream bytes.
@@ -340,6 +389,37 @@ impl HdDecoder {
         self.core
             .decode_frame(&info, core_au)
             .map_err(|_| HdError::Core)?;
+
+        // No EXSS at all (a plain core stream): the core alone is the frame.
+        // Every field is rebuilt, so nothing of the previous frame is left.
+        if exss.is_empty() {
+            self.xll.release_all_output();
+            self.synth
+                .synthesize_fixed_by_speaker(&mut self.core, false, &mut self.core_out);
+            let mut samples = std::mem::take(&mut frame.samples);
+            if self.float_output {
+                fill_speakers(&mut samples, &self.core_out.samples);
+            } else {
+                samples.clear();
+            }
+            let mut x_payload = std::mem::take(&mut frame.x_payload);
+            x_payload.clear();
+            let mut x_samples = std::mem::take(&mut frame.x_samples);
+            x_samples.clear();
+            let mut exss_descriptor_tail = std::mem::take(&mut frame.exss_descriptor_tail);
+            exss_descriptor_tail.clear();
+            *frame = HdFrame {
+                sample_rate: self.core_out.output_rate,
+                output_mask: self.core_out.ch_mask,
+                coded_mask: self.core_out.coded_mask,
+                samples,
+                x_payload,
+                x_samples,
+                exss_descriptor_tail,
+                ..HdFrame::default()
+            };
+            return Ok(());
+        }
 
         // 2) EXSS → locate the XLL asset, or take the lossy route without one.
         let exssp = ExssParser::parse(exss).map_err(|_| HdError::Exss)?;
@@ -374,9 +454,14 @@ impl HdDecoder {
         // 6) Convert 24-bit lossless ints to f32 by speaker, into the frame's
         // own buffers.
         let mut samples = std::mem::take(&mut frame.samples);
-        fill_speakers(&mut samples, &self.xll.output);
         let mut x_samples = std::mem::take(&mut frame.x_samples);
-        fill_channels(&mut x_samples, &self.xll.x_output);
+        if self.float_output {
+            fill_speakers(&mut samples, &self.xll.output);
+            fill_channels(&mut x_samples, &self.xll.x_output);
+        } else {
+            samples.clear();
+            x_samples.clear();
+        }
         // The payload changes hands: the frame's previous buffer is the one
         // the decoder fills next.
         let mut x_payload = std::mem::take(&mut frame.x_payload);
@@ -425,7 +510,7 @@ impl HdDecoder {
     fn decode_lossy(&mut self, exss: &[u8], exssp: &ExssParser, frame: &mut HdFrame) {
         // The lossless decoder's output is not this frame's: a reader of the
         // integer tap must see nothing.
-        self.xll.release_output();
+        self.xll.release_all_output();
 
         let asset = &exssp.asset;
         let mut xxch_decode_error = None;
@@ -471,9 +556,14 @@ impl HdDecoder {
         self.synth
             .synthesize_fixed_by_speaker(&mut self.core, false, &mut self.core_out);
         let mut samples = std::mem::take(&mut frame.samples);
-        fill_speakers(&mut samples, &self.core_out.samples);
         let mut x_samples = std::mem::take(&mut frame.x_samples);
-        fill_channels(&mut x_samples, &self.core_out.extension);
+        if self.float_output {
+            fill_speakers(&mut samples, &self.core_out.samples);
+            fill_channels(&mut x_samples, &self.core_out.extension);
+        } else {
+            samples.clear();
+            x_samples.clear();
+        }
         let mut exss_descriptor_tail = std::mem::take(&mut frame.exss_descriptor_tail);
         exss_descriptor_tail.clear();
 
